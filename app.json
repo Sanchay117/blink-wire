@@ -2,7 +2,7 @@
   "package_id": "com.sanchay.blinkwire",
   "edition": "202601",
   "name": "BlinkWire",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "min_app_version": "2.2.6",
   "min_sdk_version": "0.0.10",
   "entrypoint": "index.html",
@@ -17,6 +17,7 @@
       "whitelist": [
         "http://localhost:5173",
         "http://localhost:8781",
+        "http://127.0.0.1:8781",
         "https://api.telegram.org",
         "https://slack.com",
         "https://discord.com",

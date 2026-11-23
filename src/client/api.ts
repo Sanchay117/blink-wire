@@ -1,5 +1,6 @@
 export interface WireMessage {
   id: string
+  messageId: string
   platform: 'telegram' | 'slack' | 'discord' | 'news'
   chatId: string
   chatLabel: string
@@ -8,6 +9,7 @@ export interface WireMessage {
   timestamp: number
   urgency: 'URGENT' | 'ACTION' | 'FYI'
   replyable: boolean
+  isVoiceNote?: boolean
   url?: string
 }
 
@@ -25,7 +27,19 @@ export interface WireConfig {
   includeNews: boolean
 }
 
-const STORAGE_KEY = 'blinkwire.config.v1'
+export interface HealthInfo {
+  ok: boolean
+  envConfigured: {
+    telegram: boolean
+    slack: boolean
+    discord: boolean
+    ai: boolean
+    stt: boolean
+  }
+}
+
+const PREF_KEY = 'blinkwire.prefs.v2'
+const SECRET_KEY = 'blinkwire.secrets.v2'
 
 export function loadConfig(): WireConfig {
   const defaults: WireConfig = {
@@ -42,20 +56,88 @@ export function loadConfig(): WireConfig {
     includeNews: true,
   }
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return defaults
-    return { ...defaults, ...(JSON.parse(raw) as Partial<WireConfig>) }
+    const prefs = JSON.parse(localStorage.getItem(PREF_KEY) || '{}') as Partial<WireConfig>
+    const secrets = JSON.parse(sessionStorage.getItem(SECRET_KEY) || '{}') as Partial<WireConfig>
+    return { ...defaults, ...prefs, ...secrets }
   } catch {
     return defaults
   }
 }
 
 export function saveConfig(cfg: WireConfig): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg))
+  localStorage.setItem(
+    PREF_KEY,
+    JSON.stringify({
+      relayUrl: cfg.relayUrl,
+      slackChannelId: cfg.slackChannelId,
+      discordChannelId: cfg.discordChannelId,
+      openRouterModel: cfg.openRouterModel,
+      includeNews: cfg.includeNews,
+    }),
+  )
+  sessionStorage.setItem(
+    SECRET_KEY,
+    JSON.stringify({
+      telegramToken: cfg.telegramToken,
+      slackToken: cfg.slackToken,
+      discordToken: cfg.discordToken,
+      openRouterKey: cfg.openRouterKey,
+      openAiKey: cfg.openAiKey,
+      groqKey: cfg.groqKey,
+    }),
+  )
 }
 
-function apiBase(cfg: WireConfig): string {
+export function clearSessionSecrets(): void {
+  sessionStorage.removeItem(SECRET_KEY)
+}
+
+export function apiBase(cfg: WireConfig): string {
   return cfg.relayUrl.trim().replace(/\/+$/, '')
+}
+
+async function reqJson<T>(url: string, init?: RequestInit, timeoutMs = 10_000): Promise<T> {
+  const res = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) })
+  const text = await res.text()
+  let data: unknown
+  try {
+    data = JSON.parse(text)
+  } catch {
+    throw new Error(`Relay returned non-JSON (${res.status})`)
+  }
+  return data as T
+}
+
+export async function fetchHealth(cfg: WireConfig): Promise<HealthInfo> {
+  return reqJson<HealthInfo>(`${apiBase(cfg)}/api/health`, undefined, 5000)
+}
+
+export async function verifyTelegramBot(
+  cfg: WireConfig,
+  clearWebhook = false,
+): Promise<{
+  ok: boolean
+  username?: string
+  firstName?: string
+  canReadAllGroups?: boolean
+  webhookUrl?: string
+  pendingUpdates?: number
+  error?: string
+}> {
+  return reqJson(`${apiBase(cfg)}/api/telegram/verify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ telegramToken: cfg.telegramToken, clearWebhook }),
+  })
+}
+
+export function sendTelegramPresence(cfg: WireConfig, chatId: string, action: 'typing' | 'record_voice'): void {
+  void fetch(`${apiBase(cfg)}/api/telegram/action`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ telegramToken: cfg.telegramToken, chatId, action }),
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => {})
 }
 
 export async function pollInbox(cfg: WireConfig): Promise<{
@@ -65,7 +147,7 @@ export async function pollInbox(cfg: WireConfig): Promise<{
   errors: Record<string, string>
   polledAt: number
 }> {
-  const res = await fetch(`${apiBase(cfg)}/api/inbox/poll`, {
+  return reqJson(`${apiBase(cfg)}/api/inbox/poll`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -74,76 +156,85 @@ export async function pollInbox(cfg: WireConfig): Promise<{
       slackChannelId: cfg.slackChannelId,
       discordToken: cfg.discordToken,
       discordChannelId: cfg.discordChannelId,
+      groqKey: cfg.groqKey,
+      openAiKey: cfg.openAiKey,
       includeNews: cfg.includeNews,
     }),
   })
-  return (await res.json()) as {
-    ok: boolean
-    botUsername: string
-    messages: WireMessage[]
-    errors: Record<string, string>
-    polledAt: number
-  }
 }
 
 export async function fetchDrafts(
   cfg: WireConfig,
   msg: WireMessage,
+  recentThread: Array<{ sender: string; text: string }>,
 ): Promise<{ ok: boolean; source: 'ai' | 'rule'; summary: string; urgency: string; drafts: string[] }> {
-  const res = await fetch(`${apiBase(cfg)}/api/ai/drafts`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sender: msg.sender,
-      text: msg.text,
-      platform: msg.platform,
-      openRouterKey: cfg.openRouterKey,
-      openAiKey: cfg.openAiKey,
-      model: cfg.openRouterModel,
-    }),
-  })
-  return (await res.json()) as {
-    ok: boolean
-    source: 'ai' | 'rule'
-    summary: string
-    urgency: string
-    drafts: string[]
-  }
+  return reqJson(
+    `${apiBase(cfg)}/api/ai/drafts`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sender: msg.sender,
+        text: msg.text,
+        platform: msg.platform,
+        recentThread,
+        openRouterKey: cfg.openRouterKey,
+        openAiKey: cfg.openAiKey,
+        model: cfg.openRouterModel,
+      }),
+    },
+    11_000,
+  )
 }
 
-export async function sendConfirmedReply(
+export async function armReplyOnServer(
   cfg: WireConfig,
   msg: WireMessage,
-  text: string,
-): Promise<{ ok: boolean; messageId?: string; error?: string }> {
-  const res = await fetch(`${apiBase(cfg)}/api/reply/send`, {
+  payload: { kind: 'reply'; text: string } | { kind: 'reaction'; emoji: string },
+): Promise<{ ok: boolean; armToken?: string; expiresAt?: number; error?: string }> {
+  return reqJson(`${apiBase(cfg)}/api/reply/arm`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      confirmed: true,
       platform: msg.platform,
       chatId: msg.chatId,
-      text,
+      replyToMessageId: msg.messageId,
+      ...payload,
+    }),
+  })
+}
+
+export async function sendArmedReply(
+  cfg: WireConfig,
+  armToken: string,
+): Promise<{ ok: boolean; messageId?: string; error?: string }> {
+  return reqJson(`${apiBase(cfg)}/api/reply/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      armToken,
       telegramToken: cfg.telegramToken,
       slackToken: cfg.slackToken,
       discordToken: cfg.discordToken,
     }),
   })
-  return (await res.json()) as { ok: boolean; messageId?: string; error?: string }
 }
 
 export async function transcribeVoice(
   cfg: WireConfig,
   wavBase64: string,
 ): Promise<{ ok: boolean; text?: string; error?: string }> {
-  const res = await fetch(`${apiBase(cfg)}/api/voice/transcribe`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      wavBase64,
-      groqKey: cfg.groqKey,
-      openAiKey: cfg.openAiKey,
-    }),
-  })
-  return (await res.json()) as { ok: boolean; text?: string; error?: string }
+  return reqJson(
+    `${apiBase(cfg)}/api/voice/transcribe`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        wavBase64,
+        groqKey: cfg.groqKey,
+        openAiKey: cfg.openAiKey,
+      }),
+    },
+    16_000,
+  )
 }

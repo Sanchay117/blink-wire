@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite",
     "relay": "node server/standalone.ts",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit && vite build",
     "preview": "vite preview",
     "pack": "npm run build && evenhub pack app.json dist",
     "simulate": "evenhub-simulator http://localhost:5173"
