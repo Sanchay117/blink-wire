@@ -58,8 +58,10 @@ export function createInitialState(): AppState {
   let auditLog: AuditEntry[] = []
   let repliedIds: string[] = []
   try {
-    auditLog = JSON.parse(localStorage.getItem(AUDIT_KEY) || '[]') as AuditEntry[]
-    repliedIds = JSON.parse(localStorage.getItem(REPLIED_KEY) || '[]') as string[]
+    const rawAudit = JSON.parse(localStorage.getItem(AUDIT_KEY) || '[]')
+    const rawReplied = JSON.parse(localStorage.getItem(REPLIED_KEY) || '[]')
+    auditLog = Array.isArray(rawAudit) ? (rawAudit as AuditEntry[]) : []
+    repliedIds = Array.isArray(rawReplied) ? (rawReplied as string[]) : []
   } catch {
     auditLog = []
     repliedIds = []
@@ -94,60 +96,76 @@ export function persistTriageState(state: AppState): void {
   localStorage.setItem(REPLIED_KEY, JSON.stringify(state.repliedIds))
 }
 
-// Strips unsupported emojis/non-BMP glyphs that render as LVGL placeholder boxes on G2
+// Strips unsupported emojis/non-ASCII glyphs that render as LVGL placeholder boxes on G2
 export function sanitizeForG2(raw: string): string {
   return raw
     .replace(/<a?:([a-zA-Z0-9_]+):\d+>/g, ':$1:')
     .replace(/<(https?:\/\/[^|>]+)\|([^>]+)>/g, '$2')
     .replace(/<@!?(\w+)>/g, '@$1')
+    .replace(/[·•|]/g, '|')
+    .replace(/…/g, '...')
     .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\uFE0E\uFE0F]/gu, '')
-    .replace(/[^\x20-\x7E\n·…]/g, ' ')
+    .replace(/[^\x20-\x7E\n]/g, ' ')
     .replace(/[ \t]{2,}/g, ' ')
     .trim()
 }
 
-function clip(text: string, max: number): string {
+function clip(text: string, max: number, fallback = ''): string {
   const clean = sanitizeForG2(text).replace(/\n+/g, ' ')
-  return clean.length <= max ? clean : `${clean.slice(0, max - 3)}...`
+  const val = clean || fallback
+  if (!val) return ''
+  return val.length <= max ? val : `${val.slice(0, Math.max(1, max - 3))}...`
 }
 
-// Preserves explicit newlines and fills the final line properly without off-by-one truncation
+// Preserves explicit newlines and wraps long tokens without dropping trailing slices
 export function wrapLines(text: string, lineWidth = 38, maxLines = 5): string {
-  const cleaned = sanitizeForG2(text)
+  const cleaned = sanitizeForG2(text) || '[Media/Emoji]'
   const paragraphs = cleaned.split('\n')
   const out: string[] = []
-  let truncated = false
 
   for (const para of paragraphs) {
-    const words = para.trim().split(/\s+/).filter(Boolean)
-    if (words.length === 0) {
+    const rawWords = para.trim().split(/\s+/).filter(Boolean)
+    if (rawWords.length === 0) {
       if (out.length < maxLines) out.push('')
+      if (out.length >= maxLines) break
       continue
     }
+    const tokens: string[] = []
+    for (const w of rawWords) {
+      if (w.length <= lineWidth) {
+        tokens.push(w)
+      } else {
+        for (let k = 0; k < w.length; k += lineWidth) {
+          tokens.push(w.slice(k, k + lineWidth))
+        }
+      }
+    }
     let current = ''
-    for (let i = 0; i < words.length; i++) {
-      const w = words[i]
-      const next = current ? `${current} ${w}` : w
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i]
+      const next = current ? `${current} ${t}` : t
       if (next.length <= lineWidth) {
         current = next
       } else {
-        if (out.length === maxLines - 1) {
-          const base = current || w.slice(0, lineWidth - 3)
-          out.push(`${base.slice(0, lineWidth - 3)}...`)
-          truncated = true
-          break
+        out.push(current)
+        if (out.length >= maxLines) {
+          const lastIdx = maxLines - 1
+          out[lastIdx] = `${out[lastIdx].slice(0, Math.max(1, lineWidth - 3))}...`
+          return out.join('\n')
         }
-        if (current) out.push(current)
-        current = w.slice(0, lineWidth)
+        current = t
       }
     }
-    if (truncated) break
     if (current) {
-      if (out.length >= maxLines) {
-        truncated = true
-        break
-      }
       out.push(current)
+      if (out.length >= maxLines) {
+        const hasMore = paragraphs.indexOf(para) < paragraphs.length - 1
+        if (hasMore) {
+          const lastIdx = maxLines - 1
+          out[lastIdx] = `${out[lastIdx].slice(0, Math.max(1, lineWidth - 3))}...`
+        }
+        return out.slice(0, maxLines).join('\n')
+      }
     }
   }
   return out.slice(0, maxLines).join('\n')
@@ -207,11 +225,11 @@ export function renderHud(state: AppState): HudFrame {
 
     if (!current) {
       return {
-        header: `BLINKWIRE · UNREAD:${unread} · ${clock}`,
+        header: `BLINKWIRE | UNREAD:${unread} | ${clock}`,
         body: [
           state.filter === 'all' ? 'NO LIVE MESSAGES YET' : `NO ${state.filter.toUpperCase()} MESSAGES`,
           state.botUsername
-            ? `Telegram live: @${state.botUsername}`
+            ? `Telegram live: @${clip(state.botUsername, 22, 'bot')}`
             : 'Add TELEGRAM_BOT_TOKEN in Companion',
           'Send a text or voice note to your bot.',
         ].join('\n'),
@@ -222,8 +240,8 @@ export function renderHud(state: AppState): HudFrame {
     const doneTag = state.repliedIds.includes(current.id) ? ' [DONE]' : ''
     const header = `[${platformTag(current.platform)}] ${state.selectedIdx + 1}/${list.length} ${current.urgency} U:${unread} ${clock}`
     const body = [
-      `${clip(current.chatLabel, 24)} (${ageLabel(current.timestamp)})${doneTag}`,
-      `From: ${clip(current.sender, 30)}`,
+      `${clip(current.chatLabel, 20, 'Chat')} (${ageLabel(current.timestamp)})${doneTag}`,
+      `From: ${clip(current.sender, 30, 'Contact')}`,
       wrapLines(current.text, 38, 4),
     ].join('\n')
 
@@ -243,8 +261,8 @@ export function renderHud(state: AppState): HudFrame {
     })
 
     return {
-      header: `REPLY [${tag}] ${clip(target.chatLabel, 14)} ${clock}`,
-      body: [clip(state.draftSummary || target.text, 38), ...rows].join('\n'),
+      header: `REPLY [${tag}] ${clip(target.chatLabel, 14, 'Chat')} ${clock}`,
+      body: [clip(state.draftSummary || target.text, 38, '[Media/Emoji]'), ...rows].join('\n'),
       footer: 'SWIPE:pick | TAP:arm | 2x:back',
     }
   }
@@ -254,7 +272,7 @@ export function renderHud(state: AppState): HudFrame {
     return {
       header: `[MIC] REC ${secs}s/15s ${vuBar(state.voiceRms)}`,
       body: [
-        `To: ${clip(state.activeMessage.chatLabel, 32)}`,
+        `To: ${clip(state.activeMessage.chatLabel, 32, 'Contact')}`,
         'Speak short reply now...',
         '16kHz PCM -> Whisper -> 2-Tap Confirm',
       ].join('\n'),
@@ -272,7 +290,7 @@ export function renderHud(state: AppState): HudFrame {
     return {
       header: `[!] CONFIRM (${remain}s) [${platformTag(target.platform)}]`,
       body: [
-        `TO: ${clip(target.chatLabel, 33)}`,
+        `TO: ${clip(target.chatLabel, 33, 'Contact')}`,
         wrapLines(preview, 38, 3),
         '2-tap guard active (server armToken).',
       ].join('\n'),
@@ -281,8 +299,8 @@ export function renderHud(state: AppState): HudFrame {
   }
 
   return {
-    header: `BLINKWIRE RECEIPT · ${clock}`,
+    header: `BLINKWIRE RECEIPT | ${clock}`,
     body: wrapLines(state.receiptText || 'Done.', 38, 5),
-    footer: 'TAP:inbox | 2x:exit',
+    footer: 'TAP:inbox | 2x:back',
   }
 }

@@ -6,11 +6,20 @@ export interface CompanionHandlers {
   onSaveConfig: (cfg: WireConfig) => void
   onClearKeys: () => void
   onPollNow: () => void
-  onVerifyTelegram: (clearWebhook: boolean) => void
+  onVerifyTelegram: (clearWebhook: boolean, overrides?: { telegramToken?: string; relayUrl?: string }) => void
   onFilterChange: (filter: InboxFilter) => void
   onGesture: (g: G2Gesture) => void
   onSimulateVoiceText: (text: string) => void
   onBrowserMicToggle: () => void
+}
+
+const DEFAULT_SECRET_PLACEHOLDERS: Record<string, string> = {
+  telegramToken: '123456:ABC-DEF...',
+  openRouterKey: 'sk-or-v1-...',
+  groqKey: 'gsk_...',
+  openAiKey: 'sk-...',
+  slackToken: 'xoxb-...',
+  discordToken: 'MT...',
 }
 
 let hudHeaderEl: HTMLElement
@@ -24,10 +33,11 @@ let errorBannerEl: HTMLElement
 let browserMicBtnEl: HTMLButtonElement
 
 export function mountCompanionUi(
-  initialConfig: WireConfig,
+  getConfig: () => WireConfig,
   mode: 'glasses' | 'browser-preview',
   handlers: CompanionHandlers,
 ): void {
+  const initialConfig = getConfig()
   const root = document.querySelector<HTMLDivElement>('#app')!
   root.innerHTML = `
     <main class="shell">
@@ -149,10 +159,32 @@ export function mountCompanionUi(
   errorBannerEl = root.querySelector('#errorBanner')!
   browserMicBtnEl = root.querySelector('#btnBrowserMic')!
 
+  const form = root.querySelector<HTMLFormElement>('#cfgForm')!
+  const resetPasswordFields = (cfgSnapshot: WireConfig) => {
+    for (const [name, defaultHint] of Object.entries(DEFAULT_SECRET_PLACEHOLDERS)) {
+      const inp = form.querySelector<HTMLInputElement>(`input[name="${name}"]`)
+      if (!inp) continue
+      inp.value = ''
+      inp.placeholder = cfgSnapshot[name as keyof WireConfig] ? 'Loaded in session' : defaultHint
+    }
+  }
+
   root.querySelector('#btnPoll')!.addEventListener('click', handlers.onPollNow)
-  root.querySelector('#btnClearKeys')!.addEventListener('click', handlers.onClearKeys)
-  root.querySelector('#btnVerifyTg')!.addEventListener('click', () => handlers.onVerifyTelegram(false))
-  root.querySelector('#btnClearWh')!.addEventListener('click', () => handlers.onVerifyTelegram(true))
+  root.querySelector('#btnClearKeys')!.addEventListener('click', () => {
+    for (const [name, defaultHint] of Object.entries(DEFAULT_SECRET_PLACEHOLDERS)) {
+      const inp = form.querySelector<HTMLInputElement>(`input[name="${name}"]`)
+      if (!inp) continue
+      inp.value = ''
+      inp.placeholder = defaultHint
+    }
+    handlers.onClearKeys()
+  })
+  const readLiveVerifyOverrides = () => ({
+    telegramToken: form.querySelector<HTMLInputElement>('input[name="telegramToken"]')?.value.trim() || '',
+    relayUrl: form.querySelector<HTMLInputElement>('input[name="relayUrl"]')?.value.trim() || '',
+  })
+  root.querySelector('#btnVerifyTg')!.addEventListener('click', () => handlers.onVerifyTelegram(false, readLiveVerifyOverrides()))
+  root.querySelector('#btnClearWh')!.addEventListener('click', () => handlers.onVerifyTelegram(true, readLiveVerifyOverrides()))
   browserMicBtnEl.addEventListener('click', handlers.onBrowserMicToggle)
 
   root.querySelectorAll<HTMLButtonElement>('[data-g]').forEach(btn => {
@@ -166,13 +198,13 @@ export function mountCompanionUi(
     })
   })
 
-  const form = root.querySelector<HTMLFormElement>('#cfgForm')!
   form.addEventListener('submit', e => {
     e.preventDefault()
+    const current = getConfig()
     const fd = new FormData(form)
     const pick = (name: keyof WireConfig): string => {
       const val = String(fd.get(name) || '').trim()
-      return val || String(initialConfig[name] || '')
+      return val || String(current[name] || '')
     }
     const next: WireConfig = {
       relayUrl: String(fd.get('relayUrl') || '').trim(),
@@ -187,7 +219,7 @@ export function mountCompanionUi(
       groqKey: pick('groqKey'),
       includeNews: fd.get('includeNews') === 'on',
     }
-    Object.assign(initialConfig, next)
+    resetPasswordFields(next)
     handlers.onSaveConfig(next)
   })
 

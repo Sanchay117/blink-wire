@@ -3,7 +3,7 @@
   "edition": "202601",
   "name": "BlinkWire",
   "version": "0.2.0",
-  "min_app_version": "2.2.6",
+  "min_app_version": "2.2.5",
   "min_sdk_version": "0.0.10",
   "entrypoint": "index.html",
   "permissions": [
@@ -12,10 +12,15 @@
       "desc": "Capture short hands-free voice replies on Even G2."
     },
     {
+      "name": "phone-microphone",
+      "desc": "Allow voice reply fallback via companion microphone when testing in browser preview."
+    },
+    {
       "name": "network",
       "desc": "Connect to BlinkWire relay and messaging/AI APIs.",
       "whitelist": [
         "http://localhost:5173",
+        "http://127.0.0.1:5173",
         "http://localhost:8781",
         "http://127.0.0.1:8781",
         "https://api.telegram.org",

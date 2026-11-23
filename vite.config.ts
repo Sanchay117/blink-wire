@@ -3,7 +3,7 @@ import { handleApiRequest } from './server/api.ts'
 
 export default defineConfig({
   server: {
-    host: true,
+    host: process.env.VITE_HOST || '127.0.0.1',
     port: 5173,
   },
   build: {

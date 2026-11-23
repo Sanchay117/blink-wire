@@ -1,6 +1,7 @@
 node_modules/
 dist/
 *.ehpk
+demo/*.mp4
 .env
 .env.local
 .DS_Store

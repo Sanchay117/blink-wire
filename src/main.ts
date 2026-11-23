@@ -41,18 +41,24 @@ let pollInterval: number | null = null
 let prefetchTimer: number | null = null
 let isPolling = false
 let isSending = false
+let isFinishingVoice = false
 let foregroundActive = true
 let draftReqSeq = 0
 let batteryLevel: number | undefined
+let sse: EventSource | null = null
+let currentSseBase = ''
 
 const MAX_PCM_BYTES = 15 * 16000 * 2 // 15s @ 16kHz 16-bit mono = 480 KB
 const MIN_PCM_BYTES = 9600 // 0.3s minimum to prevent Whisper silence hallucination
 
 const draftCache = new Map<string, { source: 'ai' | 'rule'; summary: string; drafts: string[] }>()
 
-// Browser mic capture handles (for real voice testing without physical G2)
+// Browser mic capture handles retained at module scope to prevent GC mid-capture
 let browserMicStream: MediaStream | null = null
 let browserAudioCtx: AudioContext | null = null
+let browserMicSource: MediaStreamAudioSourceNode | null = null
+let browserMicProc: ScriptProcessorNode | null = null
+let browserMicGain: GainNode | null = null
 let browserMicActive = false
 
 function clearActionTimers(): void {
@@ -64,6 +70,102 @@ function clearActionTimers(): void {
     window.clearInterval(voiceTicker)
     voiceTicker = null
   }
+}
+
+function stopBrowserMic(): void {
+  browserMicActive = false
+  setBrowserMicRecording(false)
+  try {
+    if (browserMicProc) {
+      browserMicProc.onaudioprocess = null
+      browserMicProc.disconnect()
+    }
+  } catch {
+    // ignore disconnect failure
+  }
+  try {
+    browserMicSource?.disconnect()
+  } catch {
+    // ignore disconnect failure
+  }
+  try {
+    browserMicGain?.disconnect()
+  } catch {
+    // ignore disconnect failure
+  }
+  browserMicProc = null
+  browserMicSource = null
+  browserMicGain = null
+  browserMicStream?.getTracks().forEach(t => t.stop())
+  browserMicStream = null
+  const ctx = browserAudioCtx
+  browserAudioCtx = null
+  if (ctx) void ctx.close().catch(() => {})
+}
+
+function downsampleTo16kPcm(input: Float32Array, inputSampleRate: number): Uint8Array {
+  if (!inputSampleRate || Math.abs(inputSampleRate - 16000) < 100) {
+    const pcm = new Int16Array(input.length)
+    for (let i = 0; i < input.length; i++) {
+      const s = Math.max(-1, Math.min(1, input[i]))
+      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff
+    }
+    return new Uint8Array(pcm.buffer)
+  }
+  const ratio = inputSampleRate / 16000
+  const outLen = Math.max(1, Math.floor(input.length / ratio))
+  const pcm = new Int16Array(outLen)
+  for (let i = 0; i < outLen; i++) {
+    const start = Math.floor(i * ratio)
+    const end = Math.min(input.length, Math.floor((i + 1) * ratio))
+    let sum = 0
+    let count = 0
+    for (let j = start; j < end; j++) {
+      sum += input[j]
+      count++
+    }
+    const sample = count > 0 ? sum / count : input[start] || 0
+    const clamped = Math.max(-1, Math.min(1, sample))
+    pcm[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff
+  }
+  return new Uint8Array(pcm.buffer)
+}
+
+function closeSse(): void {
+  if (sse) {
+    sse.close()
+    sse = null
+  }
+  currentSseBase = ''
+}
+
+function connectSse(): void {
+  const base = apiBase(config)
+  if (sse && currentSseBase === base) return
+  closeSse()
+  try {
+    const es = new EventSource(`${base}/api/stream`)
+    currentSseBase = base
+    sse = es
+    es.addEventListener('messages', () => {
+      if (!foregroundActive || state.screen !== 'inbox') return
+      if (Date.now() - state.lastPollAt < 1500) return
+      void refreshInbox()
+    })
+  } catch {
+    // Polling fallback handles environments without EventSource
+  }
+}
+
+function resetToInbox(): void {
+  clearActionTimers()
+  state.armed = null
+  state.activeMessage = null
+  state.drafts = []
+  state.draftSummary = ''
+  state.voiceChunks = []
+  state.voiceRms = 0
+  state.screen = 'inbox'
 }
 
 function quickRuleDrafts(msg: WireMessage): string[] {
@@ -168,6 +270,7 @@ async function armReply(
       return
     }
     clearActionTimers()
+    const deadline = res.ttlMs ? Date.now() + res.ttlMs : res.expiresAt
     state.activeMessage = target
     state.armed = {
       target,
@@ -175,7 +278,7 @@ async function armReply(
       text: payload.kind === 'reply' ? payload.text : 'Thumbs-up reaction',
       emoji: payload.kind === 'reaction' ? payload.emoji : undefined,
       armToken: res.armToken,
-      expiresAt: res.expiresAt,
+      expiresAt: deadline,
     }
     state.screen = 'confirm_send'
     await syncHud()
@@ -188,7 +291,11 @@ async function armReply(
       if (Date.now() >= state.armed.expiresAt) {
         clearActionTimers()
         state.armed = null
-        state.screen = state.drafts.length > 0 ? 'reply_pick' : 'inbox'
+        if (state.drafts.length > 0 && state.activeMessage) {
+          state.screen = 'reply_pick'
+        } else {
+          resetToInbox()
+        }
       }
       void syncHud()
     }, 1000)
@@ -259,6 +366,7 @@ async function executeArmedSend(): Promise<void> {
 async function startG2VoiceCapture(): Promise<void> {
   const target = state.activeMessage
   if (!target) return
+  stopBrowserMic()
   clearActionTimers()
   state.voiceChunks = []
   state.voiceStartedAt = Date.now()
@@ -292,55 +400,55 @@ async function startG2VoiceCapture(): Promise<void> {
 }
 
 async function finishVoiceCapture(): Promise<void> {
-  if (isSending) return
+  if (isSending || isFinishingVoice) return
+  isFinishingVoice = true
   clearActionTimers()
-  await g2?.setMic(false)
+  stopBrowserMic()
+  // Snapshot and clear before awaiting bridge.setMic(false) to avoid duplicate triggers
   const target = state.activeMessage
   const chunks = state.voiceChunks
   state.voiceChunks = []
   state.voiceRms = 0
 
-  const totalBytes = chunks.reduce((s, c) => s + c.byteLength, 0)
-  if (!target || totalBytes < MIN_PCM_BYTES) {
-    state.receiptText =
-      'Not enough mic audio captured (<0.3s). Use G2 mic or Record Browser Mic in Companion.'
-    state.screen = 'receipt'
-    await syncHud()
-    return
-  }
-
-  isSending = true
-  state.receiptText = 'Transcribing 16kHz WAV via Whisper...'
-  state.screen = 'receipt'
-  await syncHud()
-
   try {
-    const wavBase64 = encodePcm16kToWavBase64(chunks, 16000)
-    const res = await transcribeVoice(config, wavBase64)
-    isSending = false
-    if (!res.ok || !res.text) {
-      state.receiptText = `[ERR] STT failed:\n${res.error || 'empty transcript'}`
+    await g2?.setMic(false)
+    const totalBytes = chunks.reduce((s, c) => s + c.byteLength, 0)
+    if (!target || totalBytes < MIN_PCM_BYTES) {
+      state.receiptText =
+        'Not enough mic audio captured (<0.3s). Use G2 mic or Record Browser Mic in Companion.'
+      state.screen = 'receipt'
       await syncHud()
       return
     }
-    await armReply(target, { kind: 'reply', text: res.text })
-  } catch (err) {
-    isSending = false
-    state.receiptText = `[ERR] STT error:\n${err instanceof Error ? err.message : String(err)}`
+
+    isSending = true
+    state.receiptText = 'Transcribing 16kHz WAV via Whisper...'
+    state.screen = 'receipt'
     await syncHud()
+
+    try {
+      const wavBase64 = encodePcm16kToWavBase64(chunks, 16000)
+      const res = await transcribeVoice(config, wavBase64)
+      isSending = false
+      if (!res.ok || !res.text) {
+        state.receiptText = `[ERR] STT failed:\n${res.error || 'empty transcript'}`
+        await syncHud()
+        return
+      }
+      await armReply(target, { kind: 'reply', text: res.text })
+    } catch (err) {
+      isSending = false
+      state.receiptText = `[ERR] STT error:\n${err instanceof Error ? err.message : String(err)}`
+      await syncHud()
+    }
+  } finally {
+    isFinishingVoice = false
   }
 }
 
 async function toggleBrowserMic(): Promise<void> {
   if (browserMicActive) {
-    browserMicActive = false
-    setBrowserMicRecording(false)
-    browserMicStream?.getTracks().forEach(t => t.stop())
-    browserMicStream = null
-    if (browserAudioCtx) {
-      await browserAudioCtx.close().catch(() => {})
-      browserAudioCtx = null
-    }
+    stopBrowserMic()
     await finishVoiceCapture()
     return
   }
@@ -353,10 +461,15 @@ async function toggleBrowserMic(): Promise<void> {
     return
   }
   try {
+    stopBrowserMic()
+    clearActionTimers()
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
     const ctx = new AudioContext({ sampleRate: 16000 })
+    await ctx.resume()
     const src = ctx.createMediaStreamSource(stream)
     const proc = ctx.createScriptProcessor(4096, 1, 1)
+    const silentGain = ctx.createGain()
+    silentGain.gain.value = 0
 
     state.activeMessage = target
     state.voiceChunks = []
@@ -365,6 +478,9 @@ async function toggleBrowserMic(): Promise<void> {
     state.screen = 'voice_capture'
     browserMicStream = stream
     browserAudioCtx = ctx
+    browserMicSource = src
+    browserMicProc = proc
+    browserMicGain = silentGain
     browserMicActive = true
     setBrowserMicRecording(true)
 
@@ -373,12 +489,7 @@ async function toggleBrowserMic(): Promise<void> {
     proc.onaudioprocess = ev => {
       if (!browserMicActive) return
       const f32 = ev.inputBuffer.getChannelData(0)
-      const pcm = new Int16Array(f32.length)
-      for (let i = 0; i < f32.length; i++) {
-        const s = Math.max(-1, Math.min(1, f32[i]))
-        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff
-      }
-      const bytes = new Uint8Array(pcm.buffer)
+      const bytes = downsampleTo16kPcm(f32, ctx.sampleRate)
       const currentTotal = state.voiceChunks.reduce((sum, c) => sum + c.byteLength, 0)
       if (currentTotal + bytes.byteLength <= MAX_PCM_BYTES) {
         state.voiceChunks.push(bytes)
@@ -386,9 +497,26 @@ async function toggleBrowserMic(): Promise<void> {
       }
     }
     src.connect(proc)
-    proc.connect(ctx.destination)
+    proc.connect(silentGain)
+    silentGain.connect(ctx.destination)
+
+    voiceTicker = window.setInterval(() => {
+      if (state.screen !== 'voice_capture' || !browserMicActive) {
+        clearActionTimers()
+        return
+      }
+      if (Date.now() - state.voiceStartedAt >= 15_000) {
+        stopBrowserMic()
+        void finishVoiceCapture()
+        return
+      }
+      void syncHud()
+    }, 250)
+
     await syncHud()
   } catch (err) {
+    stopBrowserMic()
+    clearActionTimers()
     state.errors = { mic: err instanceof Error ? err.message : 'Browser mic permission denied' }
     await syncHud()
   }
@@ -440,12 +568,9 @@ async function handleGesture(gesture: G2Gesture): Promise<void> {
   if (isSending) return
   try {
     if (gesture === 'double_tap') {
-      clearActionTimers()
+      stopBrowserMic()
       await g2?.setMic(false)
-      state.voiceChunks = []
-      state.armed = null
-      state.activeMessage = null
-      state.screen = 'inbox'
+      resetToInbox()
       await syncHud()
       return
     }
@@ -490,8 +615,7 @@ async function handleGesture(gesture: G2Gesture): Promise<void> {
       if (gesture === 'tap') {
         const chosen = opts[state.optionIdx]
         if (!chosen || chosen.kind === 'back') {
-          state.activeMessage = null
-          state.screen = 'inbox'
+          resetToInbox()
           await syncHud()
           return
         }
@@ -516,9 +640,15 @@ async function handleGesture(gesture: G2Gesture): Promise<void> {
         else await finishVoiceCapture()
       } else {
         clearActionTimers()
+        stopBrowserMic()
         await g2?.setMic(false)
         state.voiceChunks = []
-        state.screen = state.drafts.length > 0 ? 'reply_pick' : 'inbox'
+        state.voiceRms = 0
+        if (state.drafts.length > 0 && state.activeMessage) {
+          state.screen = 'reply_pick'
+        } else {
+          resetToInbox()
+        }
         await syncHud()
       }
       return
@@ -530,15 +660,18 @@ async function handleGesture(gesture: G2Gesture): Promise<void> {
       } else {
         clearActionTimers()
         state.armed = null
-        state.screen = state.drafts.length > 0 ? 'reply_pick' : 'inbox'
+        if (state.drafts.length > 0 && state.activeMessage) {
+          state.screen = 'reply_pick'
+        } else {
+          resetToInbox()
+        }
         await syncHud()
       }
       return
     }
 
     if (state.screen === 'receipt') {
-      state.activeMessage = null
-      state.screen = 'inbox'
+      resetToInbox()
       await syncHud()
     }
   } catch (err) {
@@ -560,6 +693,7 @@ async function boot(): Promise<void> {
         return false
       }
       clearActionTimers()
+      stopBrowserMic()
       return true
     },
     onAudioPcm: chunk => {
@@ -575,11 +709,23 @@ async function boot(): Promise<void> {
     },
     onForegroundChange: active => {
       foregroundActive = active
-      if (active && state.screen === 'inbox') void refreshInbox()
+      if (!active) {
+        clearActionTimers()
+        stopBrowserMic()
+        closeSse()
+      } else {
+        connectSse()
+        if (state.screen === 'inbox') void refreshInbox()
+      }
     },
     onExit: () => {
       clearActionTimers()
-      if (pollInterval !== null) window.clearInterval(pollInterval)
+      stopBrowserMic()
+      closeSse()
+      if (pollInterval !== null) {
+        window.clearInterval(pollInterval)
+        pollInterval = null
+      }
     },
     onFrameRendered: frame => updateHudPreview(frame),
     onModeChange: (_mode, dev) => {
@@ -588,10 +734,14 @@ async function boot(): Promise<void> {
     },
   })
 
-  mountCompanionUi(config, g2.mode, {
+  mountCompanionUi(() => config, g2.mode, {
     onSaveConfig: next => {
+      const relayChanged = next.relayUrl !== config.relayUrl
       config = next
       saveConfig(next)
+      draftCache.clear()
+      if (relayChanged) connectSse()
+      void fetchHealth(config).then(updateHealthPills).catch(() => {})
       void refreshInbox()
     },
     onClearKeys: () => {
@@ -605,13 +755,22 @@ async function boot(): Promise<void> {
         openAiKey: '',
         groqKey: '',
       }
+      draftCache.clear()
+      state.botUsername = ''
+      state.errors = {}
+      void fetchHealth(config).then(updateHealthPills).catch(() => {})
       void refreshInbox()
     },
     onPollNow: () => {
       void refreshInbox()
     },
-    onVerifyTelegram: clearWebhook => {
-      void verifyTelegramBot(config, clearWebhook)
+    onVerifyTelegram: (clearWebhook, overrides) => {
+      const effectiveCfg: WireConfig = {
+        ...config,
+        telegramToken: overrides?.telegramToken || config.telegramToken,
+        relayUrl: overrides?.relayUrl || config.relayUrl,
+      }
+      void verifyTelegramBot(effectiveCfg, clearWebhook)
         .then(r => {
           if (!r.ok) {
             showVerifyResult(`Telegram verify failed: ${r.error || 'unknown'}`, true)
@@ -647,6 +806,9 @@ async function boot(): Promise<void> {
     },
   })
 
+  // Render initial HUD + persisted audit log immediately
+  void syncHud()
+
   window.addEventListener('keydown', e => {
     const tag = (e.target as HTMLElement | null)?.tagName
     if (tag === 'INPUT' || tag === 'TEXTAREA') return
@@ -665,16 +827,12 @@ async function boot(): Promise<void> {
     }
   })
 
-  // Connect live SSE push stream for instant updates
-  try {
-    const es = new EventSource(`${apiBase(config)}/api/stream`)
-    es.addEventListener('messages', () => {
-      if (state.screen === 'inbox') void refreshInbox()
-    })
-  } catch {
-    // Polling fallback handles environments without EventSource
-  }
+  window.addEventListener('beforeunload', () => {
+    stopBrowserMic()
+    closeSse()
+  })
 
+  connectSse()
   void fetchHealth(config).then(updateHealthPills).catch(() => {})
   await refreshInbox()
   pollInterval = window.setInterval(() => {

@@ -42,6 +42,18 @@ function clampUtf8Bytes(text: string, maxBytes = 900): string {
   return text.slice(0, lo)
 }
 
+function upgradePayload(containerID: number, containerName: string, raw: string, maxBytes: number): TextContainerUpgrade {
+  const content = clampUtf8Bytes(raw, maxBytes)
+  const contentLength = new TextEncoder().encode(content).length
+  return new TextContainerUpgrade({
+    containerID,
+    containerName,
+    contentOffset: 0,
+    contentLength,
+    content,
+  })
+}
+
 export async function createG2Controller(opts: {
   initialFrame: HudFrame
   onGesture: (gesture: G2Gesture) => void
@@ -146,11 +158,17 @@ export async function createG2Controller(opts: {
         return
       }
 
-      if (textType === OsEventTypeList.SCROLL_TOP_EVENT) {
+      if (
+        textType === OsEventTypeList.SCROLL_TOP_EVENT ||
+        sysType === OsEventTypeList.SCROLL_TOP_EVENT
+      ) {
         opts.onGesture('swipe_up')
         return
       }
-      if (textType === OsEventTypeList.SCROLL_BOTTOM_EVENT) {
+      if (
+        textType === OsEventTypeList.SCROLL_BOTTOM_EVENT ||
+        sysType === OsEventTypeList.SCROLL_BOTTOM_EVENT
+      ) {
         opts.onGesture('swipe_down')
         return
       }
@@ -160,7 +178,9 @@ export async function createG2Controller(opts: {
       }
 
       if (sysType === OsEventTypeList.FOREGROUND_EXIT_EVENT) {
+        void b.audioControl(false)
         opts.onForegroundChange?.(false)
+        if (!opts.onForegroundChange) opts.onExit?.()
         return
       }
       if (sysType === OsEventTypeList.FOREGROUND_ENTER_EVENT) {
@@ -177,44 +197,27 @@ export async function createG2Controller(opts: {
     })
 
     opts.onModeChange?.('glasses')
+    if (pendingFrame) void flushFrames()
   }
 
   async function flushFrames(): Promise<void> {
-    if (flushing || !bridge) return
+    if (flushing || !bridge || cleaned) return
     flushing = true
     try {
-      while (pendingFrame && bridge) {
+      while (pendingFrame && bridge && !cleaned) {
         const next = pendingFrame
         pendingFrame = null
         try {
           if (next.header !== lastFrame.header) {
-            await bridge.textContainerUpgrade(
-              new TextContainerUpgrade({
-                containerID: 1,
-                containerName: 'header',
-                content: clampUtf8Bytes(next.header, 160),
-              }),
-            )
+            await bridge.textContainerUpgrade(upgradePayload(1, 'header', next.header, 160))
             lastFrame.header = next.header
           }
           if (next.body !== lastFrame.body) {
-            await bridge.textContainerUpgrade(
-              new TextContainerUpgrade({
-                containerID: 2,
-                containerName: 'body',
-                content: clampUtf8Bytes(next.body, 900),
-              }),
-            )
+            await bridge.textContainerUpgrade(upgradePayload(2, 'body', next.body, 900))
             lastFrame.body = next.body
           }
           if (next.footer !== lastFrame.footer) {
-            await bridge.textContainerUpgrade(
-              new TextContainerUpgrade({
-                containerID: 3,
-                containerName: 'footer',
-                content: clampUtf8Bytes(next.footer, 160),
-              }),
-            )
+            await bridge.textContainerUpgrade(upgradePayload(3, 'footer', next.footer, 160))
             lastFrame.footer = next.footer
           }
         } catch (err) {
@@ -226,12 +229,18 @@ export async function createG2Controller(opts: {
     }
   }
 
-  // Only attempt host handshake when running inside Even Hub / Simulator WebView
+  const startHandshake = () => {
+    const bridgePromise = waitForEvenAppBridge()
+    void bridgePromise.then(b => attachBridge(b)).catch(() => {})
+    return bridgePromise
+  }
+
+  // Attempt host handshake immediately when flutter host exists, or on late WebView injection
   const hasFlutterHost =
     typeof window !== 'undefined' && Boolean((window as unknown as Record<string, unknown>).flutter_inappwebview)
 
   if (hasFlutterHost) {
-    const bridgePromise = waitForEvenAppBridge()
+    const bridgePromise = startHandshake()
     const initialBridge = await new Promise<EvenAppBridge | null>(resolve => {
       const timer = window.setTimeout(() => resolve(null), 1500)
       bridgePromise
@@ -246,14 +255,19 @@ export async function createG2Controller(opts: {
     })
     if (initialBridge) {
       await attachBridge(initialBridge)
-    } else {
-      void bridgePromise.then(b => attachBridge(b)).catch(() => {})
     }
+  } else if (typeof window !== 'undefined') {
+    const onLateReady = () => {
+      if (!cleaned && !bridge) startHandshake()
+    }
+    window.addEventListener('flutterInAppWebViewPlatformReady', onLateReady, { once: true })
+    window.addEventListener('evenAppBridgeReady', onLateReady, { once: true })
   }
 
   opts.onFrameRendered?.(opts.initialFrame)
 
   async function render(frame: HudFrame): Promise<void> {
+    if (cleaned) return
     opts.onFrameRendered?.(frame)
     pendingFrame = { ...frame }
     if (!bridge) {
@@ -264,7 +278,7 @@ export async function createG2Controller(opts: {
   }
 
   async function setMic(enabled: boolean): Promise<boolean> {
-    if (!bridge) return false
+    if (!bridge || cleaned) return false
     try {
       return await bridge.audioControl(enabled)
     } catch {
@@ -275,7 +289,10 @@ export async function createG2Controller(opts: {
   function destroy(): void {
     if (cleaned) return
     cleaned = true
-    if (bridge) void bridge.audioControl(false)
+    pendingFrame = null
+    const activeBridge = bridge
+    bridge = null
+    if (activeBridge) void activeBridge.audioControl(false)
     unsubEvent?.()
     unsubDevice?.()
   }

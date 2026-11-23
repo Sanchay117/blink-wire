@@ -1,15 +1,17 @@
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { readFileSync, existsSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
+const APP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 let cachedEnv: Record<string, string> | null = null
 
 function loadDotEnvOnce(): Record<string, string> {
   if (cachedEnv) return cachedEnv
   const out: Record<string, string> = {}
   for (const name of ['.env.local', '.env']) {
-    const file = resolve(process.cwd(), name)
+    const file = resolve(APP_ROOT, name)
     if (!existsSync(file)) continue
     for (const line of readFileSync(file, 'utf8').split('\n')) {
       const trimmed = line.trim()
@@ -31,7 +33,21 @@ function env(key: string): string {
 }
 
 function redactSecrets(text: string): string {
-  return text.replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot[REDACTED]').replace(/sk-[A-Za-z0-9_-]{10,}/g, 'sk-[REDACTED]')
+  return text
+    .replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot[REDACTED]')
+    .replace(/\b\d{6,12}:[A-Za-z0-9_-]{20,}\b/g, '[TG_TOKEN_REDACTED]')
+    .replace(/\bsk-[A-Za-z0-9_-]{10,}/g, 'sk-[REDACTED]')
+    .replace(/\bgsk_[A-Za-z0-9_-]{10,}/g, 'gsk_[REDACTED]')
+    .replace(/\bxox[baprs]-[A-Za-z0-9-]+/g, 'xox-[REDACTED]')
+}
+
+const TG_TOKEN_RE = /^\d+:[A-Za-z0-9_-]{20,}$/
+function isValidTelegramToken(t: string): boolean {
+  return TG_TOKEN_RE.test(t)
+}
+
+function hashSecret(val: string): string {
+  return createHash('sha256').update(val).digest('hex')
 }
 
 function resolveCorsOrigin(req: IncomingMessage): string | null {
@@ -46,9 +62,7 @@ function resolveCorsOrigin(req: IncomingMessage): string | null {
   return null
 }
 
-function sendJson(req: IncomingMessage, res: ServerResponse, status: number, payload: unknown): void {
-  res.statusCode = status
-  res.setHeader('Content-Type', 'application/json; charset=utf-8')
+function applyCorsHeaders(req: IncomingMessage, res: ServerResponse): void {
   const origin = resolveCorsOrigin(req)
   if (origin) {
     res.setHeader('Access-Control-Allow-Origin', origin)
@@ -56,6 +70,12 @@ function sendJson(req: IncomingMessage, res: ServerResponse, status: number, pay
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+}
+
+function sendJson(req: IncomingMessage, res: ServerResponse, status: number, payload: unknown): void {
+  res.statusCode = status
+  res.setHeader('Content-Type', 'application/json; charset=utf-8')
+  applyCorsHeaders(req, res)
   res.end(JSON.stringify(payload))
 }
 
@@ -71,6 +91,10 @@ async function readJsonBody(req: IncomingMessage, maxBytes = 64 * 1024): Promise
   if (chunks.length === 0) return {}
   const text = Buffer.concat(chunks).toString('utf8').trim()
   if (!text) return {}
+  const ct = String(req.headers['content-type'] || '').toLowerCase()
+  if (!ct.includes('application/json')) {
+    throw Object.assign(new Error('Content-Type must be application/json'), { status: 415 })
+  }
   try {
     const parsed = JSON.parse(text)
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -119,6 +143,7 @@ interface TelegramMsg {
 
 interface ArmedSend {
   token: string
+  credHash: string
   kind: 'reply' | 'reaction'
   platform: 'telegram' | 'slack' | 'discord'
   chatId: string
@@ -127,6 +152,9 @@ interface ArmedSend {
   emoji?: string
   expiresAt: number
 }
+
+const MAX_TELEGRAM_CACHE = 16
+const MAX_ARMED_SENDS = 100
 
 const telegramCache = new Map<
   string,
@@ -140,6 +168,7 @@ const telegramCache = new Map<
 >()
 const armedSends = new Map<string, ArmedSend>()
 const sseClients = new Set<ServerResponse>()
+let ssePoller: ReturnType<typeof setInterval> | null = null
 let hnCache: { ts: number; items: WireMessage[] } | null = null
 
 function pruneArmed(): void {
@@ -152,12 +181,39 @@ function pruneArmed(): void {
 function broadcastSse(event: string, data: unknown): void {
   if (sseClients.size === 0) return
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
-  for (const client of sseClients) {
+  for (const client of [...sseClients]) {
+    if (client.destroyed || client.writableEnded) {
+      sseClients.delete(client)
+      continue
+    }
     try {
       client.write(payload)
     } catch {
       sseClients.delete(client)
     }
+  }
+}
+
+function ensureSsePoller(): void {
+  if (ssePoller || sseClients.size === 0) return
+  ssePoller = setInterval(() => {
+    if (sseClients.size === 0) {
+      if (ssePoller) {
+        clearInterval(ssePoller)
+        ssePoller = null
+      }
+      return
+    }
+    const tgToken = env('TELEGRAM_BOT_TOKEN')
+    if (!tgToken || !isValidTelegramToken(tgToken)) return
+    void pollTelegram(tgToken, env('GROQ_API_KEY'), env('OPENAI_API_KEY')).catch(() => {})
+  }, 3000)
+}
+
+function stopSsePollerIfIdle(): void {
+  if (sseClients.size === 0 && ssePoller) {
+    clearInterval(ssePoller)
+    ssePoller = null
   }
 }
 
@@ -251,39 +307,54 @@ async function pollTelegram(
   groqKey: string,
   openAiKey: string,
 ): Promise<{ botUsername: string; messages: WireMessage[]; webhookCleared?: boolean }> {
-  let state = telegramCache.get(token)
+  if (!isValidTelegramToken(token)) {
+    throw new Error('Invalid Telegram bot token format')
+  }
+  const cacheKey = hashSecret(token)
+  let state = telegramCache.get(cacheKey)
   if (!state) {
-    const meRes = await fetch(`https://api.telegram.org/bot${token}/getMe`, {
-      signal: AbortSignal.timeout(8000),
-    })
-    const meJson = (await meRes.json()) as {
-      ok: boolean
-      description?: string
-      result?: { username?: string; can_read_all_group_messages?: boolean }
-    }
-    if (!meJson.ok) {
-      throw new Error(redactSecrets(meJson.description || 'Invalid Telegram bot token'))
+    if (telegramCache.size >= MAX_TELEGRAM_CACHE) {
+      const oldestKey = telegramCache.keys().next().value
+      if (oldestKey) telegramCache.delete(oldestKey)
     }
     state = {
-      botUsername: meJson.result?.username || 'bot',
-      canReadAllGroups: Boolean(meJson.result?.can_read_all_group_messages),
+      botUsername: 'bot',
+      canReadAllGroups: false,
       offset: 0,
       messages: [],
       inFlight: null,
     }
-    telegramCache.set(token, state)
+    telegramCache.set(cacheKey, state)
   }
 
-  // Single-flight mutex prevents overlapping getUpdates 409 conflicts
+  // Single-flight mutex inserted synchronously before getMe/getUpdates prevents overlapping 409 conflicts
   if (state.inFlight) return state.inFlight
 
+  const activeState = state
   const run = (async () => {
+    if (activeState.botUsername === 'bot' && activeState.offset === 0) {
+      const meRes = await fetch(`https://api.telegram.org/bot${token}/getMe`, {
+        signal: AbortSignal.timeout(8000),
+      })
+      const meJson = (await meRes.json()) as {
+        ok: boolean
+        description?: string
+        result?: { username?: string; can_read_all_group_messages?: boolean }
+      }
+      if (!meJson.ok) {
+        telegramCache.delete(cacheKey)
+        throw new Error(redactSecrets(meJson.description || 'Invalid Telegram bot token'))
+      }
+      activeState.botUsername = meJson.result?.username || 'bot'
+      activeState.canReadAllGroups = Boolean(meJson.result?.can_read_all_group_messages)
+    }
+
     let webhookCleared = false
     const callUpdates = async () => {
       const u = new URL(`https://api.telegram.org/bot${token}/getUpdates`)
       u.searchParams.set('limit', '25')
       u.searchParams.set('timeout', '0')
-      if (state.offset > 0) u.searchParams.set('offset', String(state.offset))
+      if (activeState.offset > 0) u.searchParams.set('offset', String(activeState.offset))
       const res = await fetch(u, { signal: AbortSignal.timeout(8000) })
       return (await res.json()) as { ok: boolean; error_code?: number; description?: string; result?: TelegramUpdate[] }
     }
@@ -300,15 +371,17 @@ async function pollTelegram(
       throw new Error(redactSecrets(data.description || 'Telegram getUpdates failed'))
     }
 
+    const nowSec = Math.floor(Date.now() / 1000)
     const newArrivals: WireMessage[] = []
     for (const upd of data.result || []) {
-      if (upd.update_id >= state.offset) state.offset = upd.update_id + 1
+      if (upd.update_id >= activeState.offset) activeState.offset = upd.update_id + 1
+      const isEdit = Boolean(upd.edited_message)
       const msg = upd.message || upd.edited_message || upd.channel_post
       if (!msg || msg.from?.is_bot) continue
 
-      // Clean onboarding reply for /start or /ping so it doesn't clutter G2 HUD
       const rawText = (msg.text || msg.caption || '').trim()
-      if (/^\/(start|ping)\b/i.test(rawText)) {
+      // Gate /start|/ping onboarding strictly to fresh direct messages (< 120s)
+      if (upd.message && /^\/(start|ping)\b/i.test(rawText) && Math.abs(nowSec - msg.date) < 120) {
         void fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -341,7 +414,7 @@ async function pollTelegram(
 
       const sender = msg.from?.username
         ? `@${msg.from.username}`
-        : [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ') || 'Unknown'
+        : [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ') || 'Contact'
       const chatLabel =
         msg.chat.type === 'private'
           ? sender
@@ -360,24 +433,30 @@ async function pollTelegram(
         replyable: true,
         isVoiceNote,
       }
-      if (!state.messages.some(m => m.id === item.id)) {
-        state.messages.unshift(item)
+      const existingIdx = activeState.messages.findIndex(m => m.id === item.id)
+      if (existingIdx >= 0) {
+        if (isEdit) {
+          activeState.messages[existingIdx] = item
+          newArrivals.push(item)
+        }
+      } else {
+        activeState.messages.unshift(item)
         newArrivals.push(item)
       }
     }
 
-    state.messages = state.messages.slice(0, 25)
+    activeState.messages = activeState.messages.slice(0, 25)
     if (newArrivals.length > 0) {
-      broadcastSse('messages', { botUsername: state.botUsername, items: newArrivals })
+      broadcastSse('messages', { botUsername: activeState.botUsername, count: newArrivals.length })
     }
-    return { botUsername: state.botUsername, messages: state.messages, webhookCleared }
+    return { botUsername: activeState.botUsername, messages: activeState.messages, webhookCleared }
   })()
 
-  state.inFlight = run
+  activeState.inFlight = run
   try {
     return await run
   } finally {
-    state.inFlight = null
+    activeState.inFlight = null
   }
 }
 
@@ -572,8 +651,17 @@ async function generateAiDrafts(opts: {
 }
 
 export async function handleApiRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.headers.origin && !resolveCorsOrigin(req)) {
+    res.statusCode = 403
+    res.setHeader('Content-Type', 'application/json; charset=utf-8')
+    res.end(JSON.stringify({ ok: false, error: 'Origin not allowed' }))
+    return
+  }
+
   if (req.method === 'OPTIONS') {
-    sendJson(req, res, 204, {})
+    applyCorsHeaders(req, res)
+    res.statusCode = 204
+    res.end()
     return
   }
 
@@ -603,21 +691,37 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       res.setHeader('Cache-Control', 'no-cache, no-transform')
       res.setHeader('Connection', 'keep-alive')
       const origin = resolveCorsOrigin(req)
-      if (origin) res.setHeader('Access-Control-Allow-Origin', origin)
+      if (origin) {
+        res.setHeader('Access-Control-Allow-Origin', origin)
+        res.setHeader('Vary', 'Origin')
+      }
+      res.flushHeaders?.()
       res.write(`event: ready\ndata: {"ok":true}\n\n`)
       sseClients.add(res)
+      ensureSsePoller()
+
       const hb = setInterval(() => {
+        if (res.destroyed || res.writableEnded) {
+          cleanup()
+          return
+        }
         try {
           res.write(': ping\n\n')
         } catch {
-          clearInterval(hb)
-          sseClients.delete(res)
+          cleanup()
         }
       }, 20_000)
-      req.on('close', () => {
+
+      let cleanedUp = false
+      const cleanup = () => {
+        if (cleanedUp) return
+        cleanedUp = true
         clearInterval(hb)
         sseClients.delete(res)
-      })
+        stopSsePollerIfIdle()
+      }
+      res.on('close', cleanup)
+      res.on('error', cleanup)
       return
     }
 
@@ -626,6 +730,10 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       const tgToken = String(body.telegramToken || env('TELEGRAM_BOT_TOKEN')).trim()
       if (!tgToken) {
         sendJson(req, res, 400, { ok: false, error: 'No Telegram Bot Token provided.' })
+        return
+      }
+      if (!isValidTelegramToken(tgToken)) {
+        sendJson(req, res, 400, { ok: false, error: 'Invalid Telegram Bot Token format.' })
         return
       }
       if (body.clearWebhook === true) {
@@ -663,7 +771,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       const tgToken = String(body.telegramToken || env('TELEGRAM_BOT_TOKEN')).trim()
       const chatId = String(body.chatId || '').trim()
       const action = body.action === 'record_voice' ? 'record_voice' : 'typing'
-      if (tgToken && chatId) {
+      if (tgToken && isValidTelegramToken(tgToken) && chatId) {
         await fetch(`https://api.telegram.org/bot${tgToken}/sendChatAction`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -710,7 +818,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
               messages.push(...rows)
             })
             .catch(err => {
-              errors.slack = err instanceof Error ? err.message : String(err)
+              errors.slack = redactSecrets(err instanceof Error ? err.message : String(err))
             }),
         )
       }
@@ -721,7 +829,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
               messages.push(...rows)
             })
             .catch(err => {
-              errors.discord = err instanceof Error ? err.message : String(err)
+              errors.discord = redactSecrets(err instanceof Error ? err.message : String(err))
             }),
         )
       }
@@ -732,7 +840,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
               messages.push(...rows)
             })
             .catch(err => {
-              errors.news = err instanceof Error ? err.message : String(err)
+              errors.news = redactSecrets(err instanceof Error ? err.message : String(err))
             }),
         )
       }
@@ -769,10 +877,24 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 
     if (pathname === '/api/reply/arm' && req.method === 'POST') {
       const body = await readJsonBody(req)
-      const platform = body.platform === 'slack' ? 'slack' : body.platform === 'discord' ? 'discord' : 'telegram'
+      const rawPlatform = String(body.platform || '')
+      if (rawPlatform !== 'telegram' && rawPlatform !== 'slack' && rawPlatform !== 'discord') {
+        sendJson(req, res, 400, { ok: false, error: 'Invalid reply platform.' })
+        return
+      }
+      const platform = rawPlatform
       const kind = body.kind === 'reaction' ? 'reaction' : 'reply'
       const chatId = String(body.chatId || '').trim()
-      const replyToMessageId = String(body.replyToMessageId || '').trim() || undefined
+      const rawReplyId = String(body.replyToMessageId || '').trim()
+      if (rawReplyId && platform === 'telegram' && !/^\d+$/.test(rawReplyId)) {
+        sendJson(req, res, 400, { ok: false, error: 'Invalid numeric Telegram replyToMessageId.' })
+        return
+      }
+      if (rawReplyId && platform === 'discord' && !/^\d+$/.test(rawReplyId)) {
+        sendJson(req, res, 400, { ok: false, error: 'Invalid Discord replyToMessageId.' })
+        return
+      }
+      const replyToMessageId = rawReplyId || undefined
       const text = String(body.text || '').trim()
       const emoji = String(body.emoji || '👍').trim()
 
@@ -780,10 +902,27 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
         sendJson(req, res, 400, { ok: false, error: 'chatId and reply text are required.' })
         return
       }
+
+      const cred =
+        platform === 'telegram'
+          ? String(body.telegramToken || env('TELEGRAM_BOT_TOKEN')).trim()
+          : platform === 'slack'
+            ? String(body.slackToken || env('SLACK_BOT_TOKEN')).trim()
+            : String(body.discordToken || env('DISCORD_BOT_TOKEN')).trim()
+      const credHash = hashSecret(`${platform}:${cred}`)
+
+      pruneArmed()
+      while (armedSends.size >= MAX_ARMED_SENDS) {
+        const oldest = armedSends.keys().next().value
+        if (!oldest) break
+        armedSends.delete(oldest)
+      }
+
       const token = randomBytes(16).toString('hex')
-      const expiresAt = Date.now() + 8000
-      armedSends.set(token, { token, kind, platform, chatId, replyToMessageId, text, emoji, expiresAt })
-      sendJson(req, res, 200, { ok: true, armToken: token, expiresAt })
+      const ttlMs = 8000
+      const expiresAt = Date.now() + ttlMs
+      armedSends.set(token, { token, credHash, kind, platform, chatId, replyToMessageId, text, emoji, expiresAt })
+      sendJson(req, res, 200, { ok: true, armToken: token, expiresAt, ttlMs })
       return
     }
 
@@ -796,14 +935,19 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
         sendJson(req, res, 400, { ok: false, error: 'Missing or expired 2-tap armToken. Re-arm on G2.' })
         return
       }
-      armedSends.delete(armToken)
 
       if (armed.platform === 'telegram') {
         const tgToken = String(body.telegramToken || env('TELEGRAM_BOT_TOKEN')).trim()
         if (!tgToken) {
+          armedSends.delete(armToken)
           sendJson(req, res, 400, { ok: false, error: 'TELEGRAM_BOT_TOKEN is not configured.' })
           return
         }
+        if (hashSecret(`telegram:${tgToken}`) !== armed.credHash) {
+          sendJson(req, res, 403, { ok: false, error: 'Arm token does not match current Telegram credential.' })
+          return
+        }
+        armedSends.delete(armToken)
 
         if (armed.kind === 'reaction' && armed.replyToMessageId) {
           const r = await fetch(`https://api.telegram.org/bot${tgToken}/setMessageReaction`, {
@@ -816,12 +960,40 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
             }),
             signal: AbortSignal.timeout(8000),
           })
-          const j = (await r.json()) as { ok: boolean; description?: string }
-          if (!j.ok) {
-            sendJson(req, res, 502, { ok: false, error: redactSecrets(j.description || 'Reaction failed') })
+          const j = (await r.json()) as { ok: boolean; error_code?: number; description?: string }
+          if (j.ok) {
+            sendJson(req, res, 200, { ok: true, platform: 'telegram', messageId: `react:${armed.replyToMessageId}` })
             return
           }
-          sendJson(req, res, 200, { ok: true, platform: 'telegram', messageId: `react:${armed.replyToMessageId}` })
+          // Fallback gracefully to threaded thumbs-up message if chat restricts setMessageReaction
+          const fallbackPayload: Record<string, unknown> = {
+            chat_id: armed.chatId,
+            text: armed.emoji || '👍',
+            reply_parameters: {
+              message_id: Number(armed.replyToMessageId),
+              allow_sending_without_reply: true,
+            },
+          }
+          const fbRes = await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(fallbackPayload),
+            signal: AbortSignal.timeout(8000),
+          })
+          const fbJson = (await fbRes.json()) as { ok: boolean; description?: string; result?: { message_id: number } }
+          if (!fbJson.ok) {
+            sendJson(req, res, 502, {
+              ok: false,
+              error: redactSecrets(fbJson.description || j.description || 'Reaction failed'),
+            })
+            return
+          }
+          sendJson(req, res, 200, {
+            ok: true,
+            platform: 'telegram',
+            messageId: `react-msg:${fbJson.result?.message_id ?? armed.replyToMessageId}`,
+            fallback: 'message',
+          })
           return
         }
 
@@ -850,9 +1022,15 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       if (armed.platform === 'slack') {
         const slackToken = String(body.slackToken || env('SLACK_BOT_TOKEN')).trim()
         if (!slackToken) {
+          armedSends.delete(armToken)
           sendJson(req, res, 400, { ok: false, error: 'SLACK_BOT_TOKEN is not configured.' })
           return
         }
+        if (hashSecret(`slack:${slackToken}`) !== armed.credHash) {
+          sendJson(req, res, 403, { ok: false, error: 'Arm token does not match current Slack credential.' })
+          return
+        }
+        armedSends.delete(armToken)
         const r = await fetch('https://slack.com/api/chat.postMessage', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${slackToken}` },
@@ -865,7 +1043,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
         })
         const j = (await r.json()) as { ok: boolean; error?: string; ts?: string }
         if (!j.ok) {
-          sendJson(req, res, 502, { ok: false, error: `Slack send failed: ${j.error || 'unknown'}` })
+          sendJson(req, res, 502, { ok: false, error: redactSecrets(`Slack send failed: ${j.error || 'unknown'}`) })
           return
         }
         sendJson(req, res, 200, { ok: true, platform: 'slack', messageId: j.ts || '' })
@@ -875,9 +1053,15 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       if (armed.platform === 'discord') {
         const discordToken = String(body.discordToken || env('DISCORD_BOT_TOKEN')).trim()
         if (!discordToken) {
+          armedSends.delete(armToken)
           sendJson(req, res, 400, { ok: false, error: 'DISCORD_BOT_TOKEN is not configured.' })
           return
         }
+        if (hashSecret(`discord:${discordToken}`) !== armed.credHash) {
+          sendJson(req, res, 403, { ok: false, error: 'Arm token does not match current Discord credential.' })
+          return
+        }
+        armedSends.delete(armToken)
         const payload: Record<string, unknown> = { content: armed.text }
         if (armed.replyToMessageId) {
           payload.message_reference = { message_id: armed.replyToMessageId }
@@ -890,7 +1074,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
         })
         if (!r.ok) {
           const err = await r.text()
-          sendJson(req, res, 502, { ok: false, error: `Discord send ${r.status}: ${err.slice(0, 120)}` })
+          sendJson(req, res, 502, { ok: false, error: redactSecrets(`Discord send ${r.status}: ${err.slice(0, 120)}`) })
           return
         }
         const j = (await r.json()) as { id?: string }
@@ -898,6 +1082,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
         return
       }
 
+      armedSends.delete(armToken)
       sendJson(req, res, 400, { ok: false, error: 'Unsupported platform.' })
       return
     }
@@ -924,6 +1109,10 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 
     sendJson(req, res, 404, { ok: false, error: `Unknown route: ${pathname}` })
   } catch (err) {
+    if (res.headersSent || res.writableEnded) {
+      if (!res.writableEnded) res.end()
+      return
+    }
     const status = (err as { status?: number })?.status || 500
     sendJson(req, res, status, { ok: false, error: redactSecrets(err instanceof Error ? err.message : String(err)) })
   }

@@ -1,7 +1,7 @@
 {
   "name": "blink-wire",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Heads-up Telegram, Slack & Discord triage with 1-tap AI replies and G2 voice capture for Even Realities G2",
   "scripts": {
@@ -9,7 +9,7 @@
     "relay": "node server/standalone.ts",
     "build": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit && vite build",
     "preview": "vite preview",
-    "pack": "npm run build && evenhub pack app.json dist",
+    "pack": "npm run build && evenhub pack app.json dist --sdk-ver 0.0.10",
     "simulate": "evenhub-simulator http://localhost:5173"
   },
   "dependencies": {

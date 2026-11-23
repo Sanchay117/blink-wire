@@ -147,20 +147,24 @@ export async function pollInbox(cfg: WireConfig): Promise<{
   errors: Record<string, string>
   polledAt: number
 }> {
-  return reqJson(`${apiBase(cfg)}/api/inbox/poll`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      telegramToken: cfg.telegramToken,
-      slackToken: cfg.slackToken,
-      slackChannelId: cfg.slackChannelId,
-      discordToken: cfg.discordToken,
-      discordChannelId: cfg.discordChannelId,
-      groqKey: cfg.groqKey,
-      openAiKey: cfg.openAiKey,
-      includeNews: cfg.includeNews,
-    }),
-  })
+  return reqJson(
+    `${apiBase(cfg)}/api/inbox/poll`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        telegramToken: cfg.telegramToken,
+        slackToken: cfg.slackToken,
+        slackChannelId: cfg.slackChannelId,
+        discordToken: cfg.discordToken,
+        discordChannelId: cfg.discordChannelId,
+        groqKey: cfg.groqKey,
+        openAiKey: cfg.openAiKey,
+        includeNews: cfg.includeNews,
+      }),
+    },
+    25_000,
+  )
 }
 
 export async function fetchDrafts(
@@ -191,7 +195,7 @@ export async function armReplyOnServer(
   cfg: WireConfig,
   msg: WireMessage,
   payload: { kind: 'reply'; text: string } | { kind: 'reaction'; emoji: string },
-): Promise<{ ok: boolean; armToken?: string; expiresAt?: number; error?: string }> {
+): Promise<{ ok: boolean; armToken?: string; expiresAt?: number; ttlMs?: number; error?: string }> {
   return reqJson(`${apiBase(cfg)}/api/reply/arm`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -199,6 +203,9 @@ export async function armReplyOnServer(
       platform: msg.platform,
       chatId: msg.chatId,
       replyToMessageId: msg.messageId,
+      telegramToken: cfg.telegramToken,
+      slackToken: cfg.slackToken,
+      discordToken: cfg.discordToken,
       ...payload,
     }),
   })
