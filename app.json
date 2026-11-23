@@ -1,0 +1,31 @@
+{
+  "package_id": "com.sanchay.blinkwire",
+  "edition": "202601",
+  "name": "BlinkWire",
+  "version": "0.1.0",
+  "min_app_version": "2.2.6",
+  "min_sdk_version": "0.0.10",
+  "entrypoint": "index.html",
+  "permissions": [
+    {
+      "name": "g2-microphone",
+      "desc": "Capture short hands-free voice replies on Even G2."
+    },
+    {
+      "name": "network",
+      "desc": "Connect to BlinkWire relay and messaging/AI APIs.",
+      "whitelist": [
+        "http://localhost:5173",
+        "http://localhost:8781",
+        "https://api.telegram.org",
+        "https://slack.com",
+        "https://discord.com",
+        "https://openrouter.ai",
+        "https://api.openai.com",
+        "https://api.groq.com",
+        "https://hacker-news.firebaseio.com"
+      ]
+    }
+  ],
+  "supported_languages": ["en"]
+}
