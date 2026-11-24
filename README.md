@@ -1,8 +1,10 @@
+<img src="./demo/blink-wire-logo.png" alt="BlinkWire Logo" width="96" align="right" />
+
 # BlinkWire — Even Realities G2 Messaging & Telegram HUD
 
 **Hackathon Track:** Messaging & News *(Telegram, Slack, Discord)* + **Best Telegram Integration** special prize  
 **Display Target:** Even Realities G2 (`576 × 288` 4-bit monochrome green HUD + G2 `16 kHz` mic + temple touchpad / R1 ring)  
-**Demo Video:** https://youtu.be/n6BBsNBZ6_w
+**Demo Video:** [Watch BlinkWire Demo on YouTube](https://youtu.be/n6BBsNBZ6_w)
 
 ## Problem Solved
 Pulling out your phone mid-walk or mid-meeting just to check whether a Telegram message is urgent—or listen to a voice note on speakerless glasses—breaks flow. **BlinkWire** turns Even G2 into a fast, guarded messaging wire: glanceable inbox triage, auto-transcribed incoming Telegram voice notes, prefetched thread-aware AI replies, 1-tap `👍` reactions, G2 mic voice replies, and a server-enforced 2-tap safety lock.
